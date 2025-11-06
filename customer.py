@@ -5,7 +5,8 @@ customer_kfc.py (Enhanced)
 Customer-facing KFC-style ordering system with:
 - Add/remove/view items
 - Live subtotal
-- Single full payment flow
+- Full upfront payment (no split)
+- Input validation (safe and robust)
 """
 
 import mysql.connector
@@ -18,11 +19,10 @@ DB_CONFIG = {
     'user': 'root',
     'password': 'thaksin',
     'database': 'restaurant_rms',
-    'raise_on_warnings':True,
+    'raise_on_warnings': True,
 }
 
 TAX_RATE = Decimal('0.05')  # 5% GST
-
 
 # ---------- Utilities ----------
 def fm(v):
@@ -31,14 +31,13 @@ def fm(v):
         v = Decimal('0.00')
     return f"{Decimal(v).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
 
-
 def get_conn():
+    """Create MySQL connection"""
     try:
         return mysql.connector.connect(**DB_CONFIG)
     except mysql.connector.Error as err:
         print("❌ Database connection error:", err)
         sys.exit(1)
-
 
 # ---------- DB Helper Functions ----------
 def get_menu(conn):
@@ -58,7 +57,6 @@ def get_menu(conn):
     cur.close()
     return data
 
-
 def create_customer(conn, name):
     cur = conn.cursor()
     cur.execute("INSERT INTO customers (name) VALUES (%s)", (name,))
@@ -67,15 +65,16 @@ def create_customer(conn, name):
     cur.close()
     return cid
 
-
 def create_order(conn, customer_id):
     cur = conn.cursor()
-    cur.execute("INSERT INTO orders (order_type, status, customer_id) VALUES ('takeaway', 'open', %s)", (customer_id,))
+    cur.execute("""
+        INSERT INTO orders (order_type, status, customer_id)
+        VALUES ('takeaway', 'open', %s)
+    """, (customer_id,))
     conn.commit()
     oid = cur.lastrowid
     cur.close()
     return oid
-
 
 def add_order_item(conn, order_id, menu_id, qty):
     """Add dish to order"""
@@ -98,7 +97,6 @@ def add_order_item(conn, order_id, menu_id, qty):
     conn.commit()
     cur2.close()
     print(f"✅ Added {qty} × {r['name']} (₹{fm(price)} each).")
-
 
 def view_cart(conn, order_id):
     """Show items in cart with subtotal"""
@@ -123,7 +121,6 @@ def view_cart(conn, order_id):
     print("Subtotal: ₹", fm(subtotal))
     return subtotal
 
-
 def remove_item(conn, order_id):
     """Remove one item from cart"""
     subtotal = view_cart(conn, order_id)
@@ -132,12 +129,17 @@ def remove_item(conn, order_id):
     rid = input("Enter the ID of the item to remove (or blank to cancel): ").strip()
     if not rid:
         return
+    if not rid.isdigit():
+        print("⚠️ Invalid ID.")
+        return
     cur = conn.cursor()
     cur.execute("DELETE FROM order_items WHERE id=%s AND order_id=%s", (rid, order_id))
     conn.commit()
+    if cur.rowcount > 0:
+        print("🗑️ Item removed successfully.")
+    else:
+        print("⚠️ No such item found in your order.")
     cur.close()
-    print("🗑️ Item removed successfully.")
-
 
 def deduct_ingredients(conn, order_id):
     """Deduct stock based on recipe quantities"""
@@ -168,7 +170,6 @@ def deduct_ingredients(conn, order_id):
     cur2.close()
     return True, None
 
-
 def finalize_order(conn, order_id, subtotal):
     """Close the order and handle payment"""
     tax = (subtotal * TAX_RATE).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
@@ -193,30 +194,32 @@ def finalize_order(conn, order_id, subtotal):
     if amt == "":
         amt = total
     else:
-        amt = Decimal(amt)
+        try:
+            amt = Decimal(amt)
+        except:
+            print("⚠️ Invalid input. Assuming full payment.")
+            amt = total
+
     cur2 = conn.cursor()
     cur2.execute("INSERT INTO payments (order_id, amount, method) VALUES (%s,%s,'cash')", (order_id, amt))
     conn.commit()
     cur2.close()
     print("\n🎉 Payment received! Order completed successfully.")
 
-
 # ---------- Main Flow ----------
 def main():
     conn = get_conn()
     print("\n🍗 Welcome to KFC Self-Order Kiosk 🍟")
 
-    name = input("Enter your name: ").strip()
-    if not name:
-        name = "Guest"
+    name = input("Enter your name: ").strip() or "Guest"
     cust_id = create_customer(conn, name)
     order_id = create_order(conn, cust_id)
-    menu = get_menu(conn)
 
     while True:
+        menu = get_menu(conn)  # refreshed every time
         print("\n==============================")
         print("📋 Menu Options:")
-        print("1) View Menu")
+        print("1) View Menu & Add Items")
         print("2) View Cart / Subtotal")
         print("3) Remove Item")
         print("4) Checkout & Pay")
@@ -225,7 +228,6 @@ def main():
         choice = input("Choose: ").strip()
 
         if choice == "1":
-            # Show categories and add items
             cats = list(menu.keys())
             for i, c in enumerate(cats, 1):
                 print(f"{i}) {c}")
@@ -233,10 +235,13 @@ def main():
             if not ch:
                 continue
             if not ch.isdigit() or int(ch) not in range(1, len(cats)+1):
-                print("Invalid choice.")
+                print("⚠️ Invalid category choice.")
                 continue
+
             cat = cats[int(ch)-1]
             items = menu[cat]
+            valid_ids = [it['id'] for it in items]
+
             print(f"\n🍴 {cat} Menu:")
             for it in items:
                 print(f"[{it['id']}] {it['name']} - ₹{fm(it['price'])}")
@@ -246,8 +251,26 @@ def main():
                 mid = input("Enter item ID to add (or 0 to go back): ").strip()
                 if mid == "0" or mid == "":
                     break
-                qty = input("Quantity: ").strip() or "1"
-                add_order_item(conn, order_id, int(mid), int(qty))
+                if not mid.isdigit():
+                    print("⚠️ Invalid ID — must be a number.")
+                    continue
+
+                mid = int(mid)
+                if mid not in valid_ids:
+                    print("❌ That item does not belong to this category or is unavailable.")
+                    continue
+
+                qty_in = input("Quantity: ").strip()
+                if not qty_in.isdigit():
+                    print("⚠️ Invalid quantity — must be a number.")
+                    continue
+
+                qty = int(qty_in)
+                if qty <= 0:
+                    print("⚠️ Quantity must be at least 1.")
+                    continue
+
+                add_order_item(conn, order_id, mid, qty)
 
         elif choice == "2":
             view_cart(conn, order_id)
@@ -272,7 +295,7 @@ def main():
             break
 
         else:
-            print("Invalid option. Try again.")
+            print("⚠️ Invalid option. Try again.")
 
     conn.close()
     print("\n👋 Thank you for dining with us!")

@@ -7,12 +7,15 @@ Modules:
 2. Menu Management
 3. Inventory (Ingredients)
 4. Recipe Mapping (Dish → Ingredients)
-5. Table Management
+5. Run Optimizer (Knapsack, LIS, Profit Analytics)
 """
 
 import mysql.connector
 from decimal import Decimal, ROUND_HALF_UP
 import sys
+
+# ✅ Import optimizer function
+from optimizer import run_optimizer
 
 # ---------- MySQL Configuration ----------
 DB_CONFIG = {
@@ -20,7 +23,7 @@ DB_CONFIG = {
     'user': 'root',
     'password': 'thaksin',
     'database': 'restaurant_rms',
-    'raise_on_warnings':True,
+    'raise_on_warnings': True,
 }
 
 # ---------- Utility Functions ----------
@@ -91,7 +94,7 @@ def add_category(conn):
 def list_menu(conn):
     cur = conn.cursor(dictionary=True)
     cur.execute("""
-        SELECT m.id, m.name, m.price, m.is_available, c.name AS category
+        SELECT m.id, m.name, m.price, m.cost_price, m.is_available, m.prep_time, c.name AS category
         FROM menu_items m
         LEFT JOIN categories c ON c.id = m.category_id
         ORDER BY c.name, m.name
@@ -101,8 +104,12 @@ def list_menu(conn):
         print("No menu items yet.")
     else:
         print("\nMENU ITEMS:")
+        print(f"{'ID':<4} {'Dish Name':<25} {'Price(₹)':<10} {'Cost(₹)':<10} {'Prep(min)':<10} {'Category':<15} {'Avail'}")
+        print("-" * 80)
         for r in rows:
-            print(f"[{r['id']}] {r['name']} - ₹{fm(r['price'])} | {r['category'] or 'Uncategorized'} | {'✅' if r['is_available'] else '❌'}")
+            print(f"{r['id']:<4} {r['name']:<25} ₹{fm(r['price']):<9} ₹{fm(r['cost_price'] or 0):<9} "
+                  f"{r['prep_time']:<10} {r['category'] or 'Uncategorized':<15} "
+                  f"{'✅' if r['is_available'] else '❌'}")
     cur.close()
 
 def add_menu_item(conn):
@@ -114,7 +121,6 @@ def add_menu_item(conn):
     cost = read_decimal("Cost price (blank=0): ")
     prep_time = read_int("Prep time in minutes (blank=0): ")
 
-    # category
     cur = conn.cursor()
     cur.execute("SELECT id, name FROM categories ORDER BY name")
     cats = cur.fetchall()
@@ -160,7 +166,8 @@ def edit_menu_item(conn):
                  (newname, newprice, avail, mid))
     conn.commit()
     print("✅ Updated.")
-    cur2.close(); cur.close()
+    cur2.close()
+    cur.close()
 
 def delete_menu_item(conn):
     list_menu(conn)
@@ -173,11 +180,14 @@ def delete_menu_item(conn):
     cur = conn.cursor()
     cur.execute("DELETE FROM menu_items WHERE id=%s", (mid,))
     conn.commit()
-    print("✅ Deleted.")
+    if cur.rowcount > 0:
+        print("✅ Deleted successfully.")
+    else:
+        print(f"⚠️ Menu ID {mid} not found — nothing deleted.")
     cur.close()
 
 # =========================================================
-# INVENTORY
+# INVENTORY MANAGEMENT
 # =========================================================
 def list_ingredients(conn):
     cur = conn.cursor(dictionary=True)
@@ -220,44 +230,67 @@ def update_stock(conn):
     if not iid:
         return
     choice = input("Add (a) or Set new value (s): ").strip().lower()
-    cur = conn.cursor()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT name, stock, max_capacity FROM ingredients WHERE id=%s", (iid,))
+    ing = cur.fetchone()
+    if not ing:
+        print("❌ Ingredient not found.")
+        cur.close()
+        return
+
+    name = ing['name']
+    current_stock = Decimal(ing['stock'] or 0)
+    max_capacity = Decimal(ing['max_capacity'] or 100)
+
     if choice == 'a':
         amt = read_decimal("Amount to add/subtract (negative allowed): ")
-        cur.execute("UPDATE ingredients SET stock = stock + %s WHERE id=%s", (amt, iid))
+        new_stock = current_stock + amt
     else:
-        newval = read_decimal("Set new stock value: ")
-        cur.execute("UPDATE ingredients SET stock = %s WHERE id=%s", (newval, iid))
+        new_stock = read_decimal("Set new stock value: ")
+
+    if new_stock < 0:
+        new_stock = Decimal('0.00')
+        print(f"⚠️ Stock for '{name}' cannot be less than 0. Automatically set to 0.")
+    if new_stock > max_capacity:
+        new_stock = max_capacity
+        print(f"⚠️ Stock for '{name}' cannot exceed {max_capacity}. Automatically capped.")
+
+    cur2 = conn.cursor()
+    cur2.execute("UPDATE ingredients SET stock = %s WHERE id = %s", (new_stock, iid))
     conn.commit()
-    print("✅ Stock updated.")
+    print(f"✅ Stock updated: {name} → {new_stock} units.")
+    cur2.close()
     cur.close()
 
 # =========================================================
 # RECIPE MANAGEMENT
 # =========================================================
-def manage_recipes(conn):
+def manage_recipe(conn):
     while True:
         print("\n--- Recipe Manager ---")
-        print("1. View Recipes")
+        print("1. View recipe")
         print("2. Add Recipe")
         print("3. Delete Recipe")
         print("0. Back")
         ch = input("Choice: ").strip()
+
         if ch == '1':
             cur = conn.cursor(dictionary=True)
             cur.execute("""
                 SELECT r.id, m.name AS dish, i.name AS ingredient, r.qty_needed, i.unit
-                FROM recipes r
+                FROM recipe r
                 JOIN menu_items m ON m.id = r.menu_item_id
                 JOIN ingredients i ON i.id = r.ingredient_id
                 ORDER BY m.name
             """)
             rows = cur.fetchall()
             if not rows:
-                print("No recipes yet.")
+                print("No recipe yet.")
             else:
                 for r in rows:
                     print(f"[{r['id']}] {r['dish']} → {r['ingredient']} : {r['qty_needed']} {r['unit']}")
             cur.close()
+
         elif ch == '2':
             list_menu(conn)
             mid = read_int("Menu item id: ")
@@ -266,63 +299,55 @@ def manage_recipes(conn):
             qty = read_decimal("Qty needed per serving: ")
             cur = conn.cursor()
             try:
-                cur.execute("INSERT INTO recipes (menu_item_id, ingredient_id, qty_needed) VALUES (%s,%s,%s)",
-                            (mid, iid, qty))
+                cur.execute(
+                    "INSERT INTO recipe (menu_item_id, ingredient_id, qty_needed) VALUES (%s,%s,%s)",
+                    (mid, iid, qty)
+                )
                 conn.commit()
                 print("✅ Recipe link added.")
             except mysql.connector.IntegrityError:
                 print("⚠️ Already exists.")
             cur.close()
+
         elif ch == '3':
             cur = conn.cursor(dictionary=True)
             cur.execute("""
-                SELECT r.id, m.name dish, i.name ingredient
-                FROM recipes r JOIN menu_items m ON m.id=r.menu_item_id
-                JOIN ingredients i ON i.id=r.ingredient_id
+                SELECT r.id, m.name AS dish, i.name AS ingredient
+                FROM recipe r 
+                JOIN menu_items m ON m.id = r.menu_item_id
+                JOIN ingredients i ON i.id = r.ingredient_id
+                ORDER BY m.name
             """)
             rows = cur.fetchall()
+            if not rows:
+                print("⚠️ No recipes found.")
+                cur.close()
+                continue
+
             for r in rows:
                 print(f"[{r['id']}] {r['dish']} → {r['ingredient']}")
-            rid = input("Recipe ID to delete: ").strip()
-            if rid:
-                cur2 = conn.cursor()
-                cur2.execute("DELETE FROM recipes WHERE id=%s", (rid,))
-                conn.commit()
-                print("✅ Deleted.")
-                cur2.close()
-            cur.close()
-        elif ch == '0':
-            break
 
-# =========================================================
-# TABLE MANAGEMENT
-# =========================================================
-def manage_tables(conn):
-    while True:
-        print("\n--- Table Management ---")
-        print("1. List Tables")
-        print("2. Add Table")
-        print("0. Back")
-        ch = input("Choice: ").strip()
-        if ch == '1':
-            cur = conn.cursor(dictionary=True)
-            cur.execute("SELECT id, name, seats FROM restaurant_tables ORDER BY name")
-            for r in cur.fetchall():
-                print(f"[{r['id']}] {r['name']} - {r['seats']} seats")
-            cur.close()
-        elif ch == '2':
-            name = input("Table name: ").strip()
-            if not name:
-                print("⚠️ Table name required.")
+            rid = input("Recipe ID to delete: ").strip()
+            if not rid or not rid.isdigit():
+                print("⚠️ Invalid ID.")
+                cur.close()
                 continue
-            seats = read_int("Seats (blank=2): ") or 2
-            cur = conn.cursor()
-            cur.execute("INSERT INTO restaurant_tables (name, seats) VALUES (%s,%s)", (name, seats))
+
+            cur2 = conn.cursor()
+            cur2.execute("DELETE FROM recipe WHERE id=%s", (rid,))
             conn.commit()
-            print("✅ Table added.")
+
+            if cur2.rowcount > 0:
+                print("✅ Deleted successfully.")
+            else:
+                print(f"⚠️ Recipe ID {rid} not found — nothing deleted.")
+            cur2.close()
             cur.close()
+
         elif ch == '0':
             break
+        else:
+            print("⚠️ Invalid choice, try again.")
 
 # =========================================================
 # MAIN MENU
@@ -336,7 +361,7 @@ def main():
         print("2. Menu Items")
         print("3. Ingredients (Inventory)")
         print("4. Recipes")
-        print("5. Tables")
+        print("5. Run Optimizer & Analytics ⚙️")
         print("0. Exit")
         ch = input("Choice: ").strip()
         if ch == '1':
@@ -364,9 +389,10 @@ def main():
                 elif c == '3': update_stock(conn)
                 elif c == '0': break
         elif ch == '4':
-            manage_recipes(conn)
+            manage_recipe(conn)
         elif ch == '5':
-            manage_tables(conn)
+            print("\n⚙️ Running Optimizer and Analytics...\n")
+            run_optimizer()  # directly calls optimizer.py function
         elif ch == '0':
             conn.close()
             print("\n👋 Exiting Shopkeeper RMS.")
@@ -376,3 +402,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
